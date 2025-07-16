@@ -1,0 +1,378 @@
+Soil salinity prediction
+
+**GEE code**
+
+Map.centerObject(Sample, 10);
+Map.addLayer(Sample, {}, 'Study Area');
+Map.addLayer(Sample, {}, 'Sample Points');
+
+// Cloud masking
+var cloudMask = function(img) {
+  var q = img.select('QA_PIXEL');
+  var cloud = 1 << 3;
+  return img.updateMask(q.bitwiseAnd(cloud).eq(0))
+           .multiply(0.0000275)
+           .add(-0.2);
+};
+
+// Landsat composite (2020–2023)
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(Sample)
+  .filterDate('2020-06-01', '2023-09-30')
+  .filterMetadata('CLOUD_COVER', 'less_than', 40)
+  .map(cloudMask);
+
+var composite = l8.median().clip(Sample);
+
+// Add salinity indices
+var addIndices = function(image) {
+  var bands = {
+    B: image.select('SR_B2'),
+    G: image.select('SR_B3'),
+    R: image.select('SR_B4'),
+    NIR: image.select('SR_B5'),
+    SWIR1: image.select('SR_B6'),
+    SWIR2: image.select('SR_B7')
+  };
+
+  var indices = ee.Image.cat([
+    bands.NIR.divide(bands.SWIR1).rename('SI1'),
+    bands.G.multiply(bands.R).sqrt().rename('SI2'),
+    bands.G.pow(2).multiply(bands.R.pow(2)).multiply(bands.NIR.pow(2)).sqrt().rename('SI3'),
+    bands.G.pow(2).multiply(bands.R.pow(2)).sqrt().rename('SI4'),
+    bands.SWIR1.divide(bands.SWIR2).rename('SI5'),
+    bands.NIR.subtract(bands.SWIR1).divide(bands.NIR.add(bands.SWIR1)).rename('SI6'),
+    bands.SWIR1.subtract(bands.SWIR2).divide(bands.SWIR1.add(bands.SWIR2)).rename('SI7'),
+    bands.B.divide(bands.R).rename('SI8'),
+    bands.B.subtract(bands.R).divide(bands.B.add(bands.R)).rename('SI9'),
+    bands.R.subtract(bands.NIR).divide(bands.R.add(bands.NIR)).rename('NDSI'),
+    (bands.NIR.multiply(bands.R).subtract(bands.G.multiply(bands.B)))
+      .divide(bands.NIR.multiply(bands.R).add(bands.G.multiply(bands.B))).sqrt().rename('CRSI'),
+    bands.NIR.subtract(bands.R).divide(bands.NIR.add(bands.R)).rename('NDVI')
+  ]);
+
+  return image.addBands(indices);
+};
+
+composite = addIndices(composite);
+
+// Create grid tiles for tiling the study area
+var grid = Sample.geometry().coveringGrid(ee.Projection('EPSG:4326').atScale(7000));
+Map.addLayer(grid, {}, 'Grid Tiles');
+
+// Loop over first few tiles (adjust "i < N" as needed)
+var tileList = grid.toList(grid.size());
+print(grid.size())
+for (var i = 0; i < 110; i++) { // Try 4 tiles first. Increase if needed.
+  var tile = ee.Feature(tileList.get(i)).geometry();
+
+  // Clip composite and filter samples to tile
+  var compositeTile = composite.clip(tile);
+  var samplesTile = Sample.filterBounds(tile);
+
+  var sampledTile = compositeTile.sampleRegions({
+    collection: samplesTile,
+    properties: ['salinity'], // Replace with your salinity column name
+    scale: 30
+  });
+
+  // Export sample table
+  Export.table.toDrive({
+    collection: sampledTile,
+    description: 'Salinity_Samples_Tile_' + i,
+    folder: 'DL',
+    fileFormat: 'CSV',
+    selectors: ['SI1', 'SI2', 'SI3', 'SI4', 'SI5', 'SI6', 'SI7', 'SI8', 'SI9', 'NDSI', 'CRSI', 'NDVI', 'salinity']
+  });
+
+  // Export clipped image
+  Export.image.toDrive({
+    image: compositeTile.toFloat(),
+    description: 'Salinity_Composite_Tile_' + i,
+    folder: 'DL',
+    region: tile,
+    scale: 60,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+}
+
+**model creation**
+
+import pandas as pd
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from torchdiffeq import odeint_adjoint as odeint
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+
+# Update if needed
+csv_path = '/content/drive/MyDrive/Soil_Salinity/DL/Salinity_Samples_Merged.csv'
+
+df = pd.read_csv(csv_path)
+df['salinity'] = df['salinity'] - 1  # Convert 1–4 → 0–3
+
+# Merge class 1, 2 to class 0, and class 3, 4 to class 1
+df['salinity'] = df['salinity'].apply(lambda x: 0 if x <= 1 else 1)
+
+features = ['SI1', 'SI2', 'SI3', 'SI4', 'SI5', 'SI6', 'SI7', 'SI8', 'SI9', 'NDSI', 'CRSI', 'NDVI']
+X = df[features].values.astype(np.float32)
+y = df['salinity'].values.astype(int)
+
+# Normalize features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Split using your 'segment' column (from GEE)
+from sklearn.model_selection import train_test_split
+
+# Do a random 70/30 split
+train_X, test_X, train_y, test_y = train_test_split(
+    X_scaled, y, test_size=0.3, random_state=42, stratify=y)
+
+# Class weights
+class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
+
+
+class SalinityDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X)
+        self.y = torch.tensor(y)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_ds = SalinityDataset(train_X, train_y)
+test_ds = SalinityDataset(test_X, test_y)
+train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+test_loader = DataLoader(test_ds, batch_size=128)
+
+class ODEF(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, dim)
+        self.act = nn.Tanh()
+        self.linear2 = nn.Linear(dim, dim)
+
+    def forward(self, t, x):
+        return self.linear2(self.act(self.linear1(x)))
+
+class LiquidNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.fc_in = nn.Linear(input_dim, hidden_dim)
+        self.odefunc = ODEF(hidden_dim)
+        self.integration_time = torch.tensor([0, 1]).float()
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc_in(x))
+        x = odeint(self.odefunc, x, self.integration_time.to(x.device))[1]
+        return self.fc_out(x)
+
+model = LiquidNN(12, 64, 2).to(device)  # Now binary classification (2 classes)
+loss_fn = nn.CrossEntropyLoss(weight=weights_tensor)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for i, w in enumerate(class_weights):
+    print(f"Class {i} weight: {w:.4f}")
+epochs = 100
+train_loss_hist = []
+val_loss_hist = []
+
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        total_loss += loss.item()
+    train_loss_hist.append(total_loss / len(train_loader))
+
+    model.eval()
+    with torch.no_grad():
+        val_loss = sum(loss_fn(model(xb.cuda()), yb.cuda()).item() for xb, yb in test_loader) / len(test_loader)
+        val_loss_hist.append(val_loss)
+
+    print(f"Epoch {epoch+1}: Train Loss={train_loss_hist[-1]:.4f} | Val Loss={val_loss_hist[-1]:.4f}")
+plt.plot(train_loss_hist, label='Train Loss')
+plt.plot(val_loss_hist, label='Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+
+model.eval()
+y_true, y_pred = [], []
+
+with torch.no_grad():
+    for xb, yb in test_loader:
+        preds = model(xb.cuda()).argmax(1).cpu().numpy()
+        y_true.extend(yb.numpy())
+        y_pred.extend(preds)
+
+print(classification_report(y_true, y_pred, target_names=['Class 0', 'Class 1']))
+
+cm = confusion_matrix(y_true, y_pred)
+print(cm)
+ConfusionMatrixDisplay(cm, display_labels=['0', '1']).plot()
+plt.show()
+
+torch.save(model.state_dict(), '/content/drive/MyDrive/Soil_Salinity/DL/salinity_model_2c.pth')
+print("Model saved.")
+
+
+**Model evaluation on Srikakulam area**
+
+import torch
+from torch import nn
+import rasterio
+from torchdiffeq import odeint_adjoint as odeint
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from sklearn.preprocessing import StandardScaler
+
+# Step 2: Define your model class (must match training)
+class ODEF(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, dim)
+        self.act = nn.Tanh()
+        self.linear2 = nn.Linear(dim, dim)
+
+    def forward(self, t, x):
+        return self.linear2(self.act(self.linear1(x)))
+
+class LiquidNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.fc_in = nn.Linear(input_dim, hidden_dim)
+        self.odefunc = ODEF(hidden_dim)
+        self.integration_time = torch.tensor([0, 1]).float()
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc_in(x))
+        x = odeint(self.odefunc, x, self.integration_time.to(x.device))[1]
+        return self.fc_out(x)
+
+# Step 3: Load the trained model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = LiquidNN(12, 64, 2).to(device)
+model.load_state_dict(torch.load('/content/drive/MyDrive/Soil_Salinity/DL/salinity_model_2c.pth', map_location=device))
+model.eval()
+
+# Step 4: Load and preprocess the GeoTIFF image
+tif_path = "/content/drive/MyDrive/Soil_Salinity/DL/Srikakulam_12Band_Composite.tif"  # Replace with your uploaded file path
+
+with rasterio.open(tif_path) as src:
+    img = src.read().astype(np.float32)  # Shape: (bands, height, width)
+    profile = src.profile
+
+bands, height, width = img.shape
+img = img.reshape(bands, -1).T  # Reshape to (num_pixels, num_features)
+
+# 4. Normalize with StandardScaler (same as training)
+scaler = StandardScaler()
+img_scaled = scaler.fit_transform(img)  # Ideally use the scaler fitted on training data
+
+# 5. Predict
+features_tensor = torch.tensor(img_scaled, dtype=torch.float32).to(device)
+with torch.no_grad():
+    logits = model(features_tensor)
+    preds = logits.argmax(dim=1).cpu().numpy()  # shape: (num_pixels,)
+
+# 6. Reshape and visualize
+predicted_map = preds.reshape(height, width)
+
+# Plot prediction
+plt.figure(figsize=(10, 10))
+plt.imshow(predicted_map, cmap='RdYlGn')  # Green = class 0, Red = class 1
+plt.title("Soil Salinity Prediction Map (Liquid NN)")
+plt.axis('off')
+plt.colorbar(label='Salinity Class')
+plt.show()
+
+# 7. Optional: Save predicted GeoTIFF
+out_profile = profile.copy()
+out_profile.update(dtype=rasterio.uint8, count=1)
+
+with rasterio.open("/content/salinity_prediction_map.tif", "w", **out_profile) as dst:
+    dst.write(predicted_map.astype(np.uint8), 1)
+
+
+# Load the image
+with rasterio.open('Srikakulam_12Band_Composite.tif') as src:
+    image_data = src.read()  # shape: (bands, height, width)
+    profile = src.profile
+
+
+# Assume your model expects (batch_size, 12)
+bands, height, width = image_data.shape
+reshaped_data = image_data.reshape(bands, -1).T  # shape: (height*width, bands)
+
+# Normalize if your training used StandardScaler
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+reshaped_data = scaler.fit_transform(reshaped_data)  # Use saved scaler ideally
+
+# Convert to tensor and predict
+model.eval()
+inputs = torch.tensor(reshaped_data, dtype=torch.float32).to('cuda')  # if using GPU
+
+with torch.no_grad():
+    outputs = model(inputs)
+    predicted_classes = torch.argmax(outputs, dim=1).cpu().numpy()
+
+# Reshape back to image format
+classified_image = predicted_classes.reshape(height, width)
+
+# Visualize: 0 = green (low salinity), 1 = red (high salinity)
+plt.figure(figsize=(10, 10))
+plt.imshow(classified_image, cmap='RdYlGn')  # green to red
+plt.title("Soil Salinity Prediction Map")
+plt.axis('off')
+plt.show()
+
+# Save classified output as GeoTIFF
+with rasterio.open('Srikakulam_Predicted_Salinity.tif', 'w', **profile) as dst:
+    dst.write(classified_image.astype(rasterio.uint8), 1)
+
+
+
+
+**visualisation**
+
+
+// Load your uploaded GeoTIFF
+var image = ee.Image("projects/ee-harshav1575/assets/salinity_prediction_map_1");
+
+// Center the map to a region of interest
+Map.centerObject(image, 9);  // Adjust zoom level as needed
+
+// Define visualization parameters
+var visParams = {
+  min: 0,       // Minimum pixel value (adjust based on your data)
+  max: 1,       // Maximum pixel value (adjust based on your data)
+  palette: ['red', 'green']  // Choose any color palette
+};
+
+// Add image layer to the map
+var clipped = image.clip(region);
+Map.centerObject(region, 9);
+Map.addLayer(clipped, visParams, 'Clipped Salinity Map');
+
